@@ -82,7 +82,7 @@ button,select,input{font:inherit;color:inherit}
 const SPORTS={nhl:'NHL',nfl:'NFL'};
 const SPLITS=[['l5','L5'],['l10','L10'],['l20','L20'],['home','Home'],['away','Away']];
 const TABS=[['cheat','Cheatsheet'],['all','All props'],['slip','My slip']];
-let DB=[];
+let DB=[],ERR='';
 const fmtTime=iso=>new Date(iso).toLocaleString([],{weekday:"short",hour:"numeric",minute:"2-digit"});
 
 function why(p,split,line){
@@ -134,6 +134,7 @@ function renderControls(){
 
 function render(){
   renderControls();
+  if(!DB.length){$('banner').textContent='';$('grid').innerHTML='<div class="card" style="grid-column:1/-1">'+esc(ERR||'Loading props...')+'</div>';return}
   const q=S.q.toLowerCase();
   let list=DB.filter(p=>{
     if(S.tab==='slip'){if(!S.slip.includes(p.id))return false}
@@ -230,7 +231,7 @@ async function load(){
     DB=d.props;
     $('upd').textContent='Updated '+new Date(d.updated).toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
     if(!DB.some(p=>p.sport===S.sport))S.sport=DB[0].sport;
-  }catch(e){$('grid').innerHTML='<div class="card" style="grid-column:1/-1">'+esc(e.message)+'</div>';return}
+  }catch(e){ERR=e.message;render();return}
   render();
 }
 load();
