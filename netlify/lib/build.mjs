@@ -4,9 +4,11 @@ const NHLAPI = 'https://api-web.nhle.com/v1';
 const ESPN = 'https://site.api.espn.com/apis/site/v2/sports';
 const MARKETS = {
   nhl: { key: 'icehockey_nhl', espn: 'hockey/nhl', list: {
-    player_shots_on_goal: ['Shots on goal', 'shots'], player_points: ['Points', 'points'], player_assists: ['Assists', 'assists'] } },
+    player_shots_on_goal: ['Shots on goal', 'shots'], player_points: ['Points', 'points'], player_assists: ['Assists', 'assists'],
+    player_goals: ['Goals', 'goals'], player_power_play_points: ['Power play points', 'powerPlayPoints'], player_blocked_shots: ['Blocked shots', 'blockedShots'] } },
   nfl: { key: 'americanfootball_nfl', espn: 'football/nfl', list: {
-    player_rush_yds: ['Rushing yards', 'rushing_yards'], player_reception_yds: ['Receiving yards', 'receiving_yards'], player_receptions: ['Receptions', 'receptions'] } },
+    player_rush_yds: ['Rushing yards', 'rushing_yards'], player_reception_yds: ['Receiving yards', 'receiving_yards'], player_receptions: ['Receptions', 'receptions'],
+    player_pass_yds: ['Passing yards', 'passing_yards'], player_rush_attempts: ['Rush attempts', 'carries'] } },
 };
 const NFL = { 'Arizona Cardinals':'ARI','Atlanta Falcons':'ATL','Baltimore Ravens':'BAL','Buffalo Bills':'BUF','Carolina Panthers':'CAR','Chicago Bears':'CHI','Cincinnati Bengals':'CIN','Cleveland Browns':'CLE','Dallas Cowboys':'DAL','Denver Broncos':'DEN','Detroit Lions':'DET','Green Bay Packers':'GB','Houston Texans':'HOU','Indianapolis Colts':'IND','Jacksonville Jaguars':'JAX','Kansas City Chiefs':'KC','Las Vegas Raiders':'LV','Los Angeles Chargers':'LAC','Los Angeles Rams':'LA','Miami Dolphins':'MIA','Minnesota Vikings':'MIN','New England Patriots':'NE','New Orleans Saints':'NO','New York Giants':'NYG','New York Jets':'NYJ','Philadelphia Eagles':'PHI','Pittsburgh Steelers':'PIT','San Francisco 49ers':'SF','Seattle Seahawks':'SEA','Tampa Bay Buccaneers':'TB','Tennessee Titans':'TEN','Washington Commanders':'WAS' };
 const ab = (t) => (t === 'LAR' ? 'LA' : t);
@@ -63,6 +65,14 @@ function inj(m, player, team, opp) {
   return { self: self ? self.status + (self.detail ? ': ' + self.detail : '') : null, team: list(team).filter(bad).slice(0, 4).map(fmt), opp: list(opp).filter(bad).slice(0, 4).map(fmt) };
 }
 
+// Warn when a market had lines but nothing usable came out (usually a missing stat field)
+function warn(sport, raw, out, errors) {
+  for (const k of Object.keys(MARKETS[sport].list)) {
+    if (raw.some((r) => r.mkey === k) && !out.some((p) => p.id.endsWith('-' + k))) errors.push(`${sport}: ${k} had lines but no usable game data (stat field may be missing)`);
+  }
+  return out;
+}
+
 function assemble(sport, r, games, team, opp, home, injMap, teamFull, oppFull) {
   const cnt = {}; r.books.forEach((b) => (cnt[b.line] = (cnt[b.line] || 0) + 1));
   const line = +Object.entries(cnt).sort((a, b) => b[1] - a[1] || a[0] - b[0])[0][0];
@@ -71,7 +81,18 @@ function assemble(sport, r, games, team, opp, home, injMap, teamFull, oppFull) {
     market: MARKETS[sport].list[r.mkey][0], line, odds: books.find((b) => b.line === line).odds, books, games, injury: inj(injMap, r.player, teamFull, oppFull) };
 }
 
-async function nhl() {
+// Stats missing from the NHL game log are read from each game's boxscore instead
+const BOX = new Set(['blockedShots']);
+const boxes = new Map();
+async function boxStat(gid, pid, stat) {
+  if (!boxes.has(gid)) boxes.set(gid, getJson(`${NHLAPI}/gamecenter/${gid}/boxscore`).catch(() => null));
+  const b = await boxes.get(gid);
+  if (!b) return null;
+  const ps = ['homeTeam', 'awayTeam'].flatMap((t) => ['forwards', 'defense'].flatMap((k) => b.playerByGameStats?.[t]?.[k] || []));
+  return ps.find((p) => p.playerId === pid)?.[stat] ?? null;
+}
+
+async function nhl(errors) {
   const cfg = MARKETS.nhl, raw = await oddsProps(cfg);
   if (!raw.length) return [];
   const st = await getJson(`${NHLAPI}/standings/now`);
@@ -89,11 +110,16 @@ async function nhl() {
     const side = rosters[h]?.has(n) ? 'home' : rosters[a]?.has(n) ? 'away' : null;
     if (!side) return null;
     const stat = cfg.list[r.mkey][1];
-    const g = (await logs(rosters[side === 'home' ? h : a].get(n))).slice(0, 20).map((x) => ({ v: x[stat] ?? 0, opp: x.opponentAbbrev, home: x.homeRoadFlag === 'H', date: md(x.gameDate) }));
+    const pid = rosters[side === 'home' ? h : a].get(n);
+    const rowsL = (await logs(pid)).slice(0, 20), g = [];
+    for (const x of rowsL) {
+      const v = BOX.has(stat) ? await boxStat(x.gameId, pid, stat) : x[stat];
+      if (v != null) g.push({ v, opp: x.opponentAbbrev, home: x.homeRoadFlag === 'H', date: md(x.gameDate) });
+    }
     if (g.length < 5) return null;
     return side === 'home' ? assemble('nhl', r, g, h, a, true, injMap, e.home_team, e.away_team) : assemble('nhl', r, g, a, h, false, injMap, e.away_team, e.home_team);
   });
-  return res.filter(Boolean);
+  return warn('nhl', raw, res.filter(Boolean), errors);
 }
 
 async function nfl(errors) {
@@ -114,16 +140,17 @@ async function nfl(errors) {
   for (const r of rows) { if (r.season_type && r.season_type !== 'REG') continue; const k = norm(r.player_display_name); if (!by.has(k)) by.set(k, []); by.get(k).push(r); }
   for (const v of by.values()) v.sort((a, b) => b.season - a.season || b.week - a.week);
   const injMap = await injuries(cfg.espn);
-  return raw.map((r) => {
+  const out = raw.map((r) => {
     const e = r.event, h = ab(NFL[e.home_team]), a = ab(NFL[e.away_team]), list = by.get(norm(r.player));
     if (!list || !h || !a) return null;
     const t = ab(list[0].team || list[0].recent_team), stat = cfg.list[r.mkey][1];
     if (t !== h && t !== a) return null;
-    const g = list.slice(0, 20).map((x) => { const i = sched[`${x.season}|${x.week}|${x.team || x.recent_team}`]; return { v: +x[stat] || 0, opp: x.opponent_team, home: i ? i.home : null, date: i ? md(i.date) : `W${x.week}` }; });
-    if (g.length < 5) return null;
+    const g = list.slice(0, 20).map((x) => { const i = sched[`${x.season}|${x.week}|${x.team || x.recent_team}`]; return { v: x[stat] === undefined || x[stat] === '' ? null : +x[stat] || 0, opp: x.opponent_team, home: i ? i.home : null, date: i ? md(i.date) : `W${x.week}` }; });
+    if (g.length < 5 || g.some((x) => x.v === null)) return null;
     const home = t === h;
     return assemble('nfl', r, g, t, home ? a : h, home, injMap, home ? e.home_team : e.away_team, home ? e.away_team : e.home_team);
   }).filter(Boolean);
+  return warn('nfl', raw, out, errors);
 }
 
 export async function build() {
