@@ -31,21 +31,33 @@ function csv(t) {
 }
 
 // Over lines from every bookmaker, grouped by player and market
-async function oddsProps(cfg) {
-  const key = process.env.ODDS_API_KEY;
-  if (!key) throw new Error('ODDS_API_KEY is not set');
+// Each sport can use its own odds provider: NHL_ODDS_BASE_URL / NHL_ODDS_KEY, NFL_ODDS_BASE_URL / NFL_ODDS_KEY.
+// Anything unset falls back to ODDS_BASE_URL / ODDS_API_KEY, then to The Odds API.
+async function oddsProps(cfg, sport) {
+  const U = sport.toUpperCase();
+  const key = process.env[`${U}_ODDS_KEY`] || process.env.ODDS_API_KEY;
+  const base = process.env[`${U}_ODDS_BASE_URL`] || process.env.ODDS_BASE_URL || ODDS;
+  if (!key) throw new Error(`No odds API key set for ${sport} (set ${U}_ODDS_KEY or ODDS_API_KEY)`);
   const regions = process.env.ODDS_REGIONS || 'us', horizon = Number(process.env.HORIZON_HOURS || 36);
-  const events = await getJson(`${ODDS}/sports/${cfg.key}/events?apiKey=${key}`);
-  const soon = events.filter((e) => { const h = (new Date(e.commence_time) - Date.now()) / 36e5; return h > -1 && h < horizon; });
-  const markets = Object.keys(cfg.list).join(',');
-  const res = await pool(soon, 3, async (e) => ({ e, o: await getJson(`${ODDS}/sports/${cfg.key}/events/${e.id}/odds?apiKey=${key}&regions=${regions}&markets=${markets}&oddsFormat=american`) }));
+  const events = await getJson(`${base}/sports/${cfg.key}/events?apiKey=${key}`);
+  const soon = events.filter((e) => { const h = (new Date(e.commence_time) - Date.now()) / 36e5; return h > -1 && h < horizon; }).slice(0, Number(process.env.MAX_EVENTS || 50));
+  const only = (process.env.MARKETS || '').split(',').map((x) => x.trim()).filter(Boolean);
+  const markets = Object.keys(cfg.list).filter((k) => !only.length || only.includes(k)).join(',');
+  if (!markets) return [];
+  const res = await pool(soon, 3, async (e) => ({ e, o: await getJson(`${base}/sports/${cfg.key}/events/${e.id}/odds?apiKey=${key}&regions=${regions}&markets=${markets}&oddsFormat=american`) }));
   const map = new Map();
+  // BOOKS=DraftKings,FanDuel,... keeps only those books. If unset, DFS and sweepstakes apps are dropped
+  // because their synthetic even-money prices would distort best-odds and edge.
+  const allow = (process.env.BOOKS || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean);
+  const DFS = /prizepicks|underdog|sleeper|dabble|parlayplay|pick6|fliff|sportzino|thrillzz|courtside/i;
+  const okBook = (b) => (allow.length ? allow.includes(String(b.title).toLowerCase()) || allow.includes(String(b.key).toLowerCase()) : !DFS.test(`${b.key} ${b.title}`));
   for (const r of res) {
     if (!r) continue;
-    for (const b of r.o.bookmakers || []) for (const m of b.markets || []) for (const x of m.outcomes || []) {
+    for (const b of (r.o.bookmakers || []).filter(okBook)) for (const m of b.markets || []) for (const x of m.outcomes || []) {
       if (x.name !== 'Over' || !cfg.list[m.key]) continue;
-      const k = `${norm(x.description)}|${m.key}`;
-      if (!map.has(k)) map.set(k, { player: x.description, mkey: m.key, event: r.e, books: [] });
+      const pname = String(x.description || '').replace(/\s*\([^)]*\)\s*$/, '').trim(); // some feeds append "(TEAM)"
+      const k = `${norm(pname)}|${m.key}`;
+      if (!map.has(k)) map.set(k, { player: pname, mkey: m.key, event: r.e, books: [] });
       map.get(k).books.push({ book: b.title, line: x.point, odds: x.price });
     }
   }
@@ -93,7 +105,7 @@ async function boxStat(gid, pid, stat) {
 }
 
 async function nhl(errors) {
-  const cfg = MARKETS.nhl, raw = await oddsProps(cfg);
+  const cfg = MARKETS.nhl, raw = await oddsProps(cfg, 'nhl');
   if (!raw.length) return [];
   const st = await getJson(`${NHLAPI}/standings/now`);
   const teams = st.standings.map((t) => ({ abbr: t.teamAbbrev.default, common: t.teamCommonName.default }));
@@ -123,7 +135,7 @@ async function nhl(errors) {
 }
 
 async function nfl(errors) {
-  const cfg = MARKETS.nfl, raw = await oddsProps(cfg);
+  const cfg = MARKETS.nfl, raw = await oddsProps(cfg, 'nfl');
   if (!raw.length) return [];
   const now = new Date(), y = now.getFullYear(), s = now.getMonth() >= 8 ? y : y - 1, rows = [];
   for (const yr of [s, s - 1]) {
@@ -155,7 +167,7 @@ async function nfl(errors) {
 
 export async function build() {
   const out = { updated: new Date().toISOString(), props: [], errors: [] };
-  for (const [sport, fn] of [['nhl', nhl], ['nfl', nfl]]) {
+  for (const [sport, fn] of [['nhl', nhl], ['nfl', nfl]].filter(([sp]) => (process.env.SPORTS || 'nhl,nfl').includes(sp))) {
     try { out.props.push(...(await fn(out.errors))); } catch (e) { out.errors.push(`${sport}: ${e.message}`); }
   }
   return out;
