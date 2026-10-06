@@ -11,11 +11,21 @@ const MARKETS = {
     player_pass_yds: ['Passing yards', 'passing_yards'], player_rush_attempts: ['Rush attempts', 'carries'] } },
 };
 const NFL = { 'Arizona Cardinals':'ARI','Atlanta Falcons':'ATL','Baltimore Ravens':'BAL','Buffalo Bills':'BUF','Carolina Panthers':'CAR','Chicago Bears':'CHI','Cincinnati Bengals':'CIN','Cleveland Browns':'CLE','Dallas Cowboys':'DAL','Denver Broncos':'DEN','Detroit Lions':'DET','Green Bay Packers':'GB','Houston Texans':'HOU','Indianapolis Colts':'IND','Jacksonville Jaguars':'JAX','Kansas City Chiefs':'KC','Las Vegas Raiders':'LV','Los Angeles Chargers':'LAC','Los Angeles Rams':'LA','Miami Dolphins':'MIA','Minnesota Vikings':'MIN','New England Patriots':'NE','New Orleans Saints':'NO','New York Giants':'NYG','New York Jets':'NYJ','Philadelphia Eagles':'PHI','Pittsburgh Steelers':'PIT','San Francisco 49ers':'SF','Seattle Seahawks':'SEA','Tampa Bay Buccaneers':'TB','Tennessee Titans':'TEN','Washington Commanders':'WAS' };
+const DEBUG = {}; // shown in /api/props to help diagnose missing games
 const ab = (t) => (t === 'LAR' ? 'LA' : t);
 
 const norm = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z ]/g, '').replace(/\s+/g, ' ').trim();
 const md = (d) => { const [, m, x] = d.split('-'); return `${+m}/${+x}`; };
-const getText = async (url) => { const r = await fetch(url, { signal: AbortSignal.timeout(60000) }); if (!r.ok) throw new Error(`${r.status} ${url.replace(/apiKey=[^&]+/, 'apiKey=***')}`); return r.text(); };
+const sleep = (ms) => new Promise((z) => setTimeout(z, ms));
+// Retries rate-limited (429) requests, honouring Retry-After
+const getText = async (url) => {
+  for (let i = 0; ; i++) {
+    const r = await fetch(url, { signal: AbortSignal.timeout(60000) });
+    if (r.status === 429 && i < 3) { await sleep(Math.min(Number(r.headers.get('retry-after')) || 2 * (i + 1), 20) * 1000); continue; }
+    if (!r.ok) throw new Error(`${r.status} ${url.replace(/apiKey=[^&]+/, 'apiKey=***')}`);
+    return r.text();
+  }
+};
 const getJson = async (url) => JSON.parse(await getText(url));
 async function pool(items, n, fn) {
   const out = []; let i = 0;
@@ -44,7 +54,12 @@ async function oddsProps(cfg, sport) {
   const only = (process.env.MARKETS || '').split(',').map((x) => x.trim()).filter(Boolean);
   const markets = Object.keys(cfg.list).filter((k) => !only.length || only.includes(k)).join(',');
   if (!markets) return [];
-  const res = await pool(soon, 3, async (e) => ({ e, o: await getJson(`${base}/sports/${cfg.key}/events/${e.id}/odds?apiKey=${key}&regions=${regions}&markets=${markets}&oddsFormat=american`) }));
+  const res = await pool(soon, 1, async (e) => {
+    await sleep(300); // one game at a time, spaced out, to stay under burst limits
+    try { return { e, o: await getJson(`${base}/sports/${cfg.key}/events/${e.id}/odds?apiKey=${key}&regions=${regions}&markets=${markets}&oddsFormat=american`) }; }
+    catch (err) { return { e, err: err.message }; }
+  });
+  DEBUG[sport] = { eventsListed: events.length, inWindow: soon.length, games: res.map((r) => (r ? `${r.e.away_team} @ ${r.e.home_team}: ${r.err ? 'ERROR ' + r.err : (r.o.bookmakers || []).length + ' books'}` : 'failed')) };
   const map = new Map();
   // BOOKS=DraftKings,FanDuel,... keeps only those books. If unset, DFS and sweepstakes apps are dropped
   // because their synthetic even-money prices would distort best-odds and edge.
@@ -52,7 +67,7 @@ async function oddsProps(cfg, sport) {
   const DFS = /prizepicks|underdog|sleeper|dabble|parlayplay|pick6|fliff|sportzino|thrillzz|courtside/i;
   const okBook = (b) => (allow.length ? allow.includes(String(b.title).toLowerCase()) || allow.includes(String(b.key).toLowerCase()) : !DFS.test(`${b.key} ${b.title}`));
   for (const r of res) {
-    if (!r) continue;
+    if (!r || !r.o) continue;
     for (const b of (r.o.bookmakers || []).filter(okBook)) for (const m of b.markets || []) for (const x of m.outcomes || []) {
       if (x.name !== 'Over' || !cfg.list[m.key]) continue;
       const pname = String(x.description || '').replace(/\s*\([^)]*\)\s*$/, '').trim(); // some feeds append "(TEAM)"
@@ -116,11 +131,12 @@ async function nhl(errors) {
   const injMap = await injuries(cfg.espn);
   const now = new Date(), y = now.getFullYear(), s = now.getMonth() >= 8 ? y : y - 1, seasons = [`${s}${s + 1}`, `${s - 1}${s}`];
   const cache = new Map();
-  const logs = (id) => { if (!cache.has(id)) cache.set(id, (async () => { let all = []; for (const se of seasons) { try { all = all.concat((await getJson(`${NHLAPI}/player/${id}/game-log/${se}/2`)).gameLog || []); } catch {} if (all.length >= 20) break; } return all.sort((a, b) => b.gameDate.localeCompare(a.gameDate)); })()); return cache.get(id); };
+  const logs = (id) => { if (!cache.has(id)) cache.set(id, (async () => { let all = []; for (const se of seasons) { try { all = all.concat(((await getJson(`${NHLAPI}/player/${id}/game-log/${se}/2`)).gameLog || []).filter((x) => String(x.gameId).slice(4, 6) === '02')); } catch {} if (all.length >= 20) break; } return all.sort((a, b) => b.gameDate.localeCompare(a.gameDate)); })()); return cache.get(id); };
+  const drops = { noRoster: [], shortLog: [] };
   const res = await pool(raw, 8, async (r) => {
     const e = r.event, h = abbr(e.home_team), a = abbr(e.away_team), n = norm(r.player);
     const side = rosters[h]?.has(n) ? 'home' : rosters[a]?.has(n) ? 'away' : null;
-    if (!side) return null;
+    if (!side) { drops.noRoster.push(r.player); return null; }
     const stat = cfg.list[r.mkey][1];
     const pid = rosters[side === 'home' ? h : a].get(n);
     const rowsL = (await logs(pid)).slice(0, 20), g = [];
@@ -128,9 +144,10 @@ async function nhl(errors) {
       const v = BOX.has(stat) ? await boxStat(x.gameId, pid, stat) : x[stat];
       if (v != null) g.push({ v, opp: x.opponentAbbrev, home: x.homeRoadFlag === 'H', date: md(x.gameDate) });
     }
-    if (g.length < 5) return null;
+    if (g.length < 5) { drops.shortLog.push(r.player); return null; }
     return side === 'home' ? assemble('nhl', r, g, h, a, true, injMap, e.home_team, e.away_team) : assemble('nhl', r, g, a, h, false, injMap, e.away_team, e.home_team);
   });
+  DEBUG.nhlDropped = { noRoster: drops.noRoster.slice(0, 15), shortLog: drops.shortLog.slice(0, 15) };
   return warn('nhl', raw, res.filter(Boolean), errors);
 }
 
@@ -166,7 +183,7 @@ async function nfl(errors) {
 }
 
 export async function build() {
-  const out = { updated: new Date().toISOString(), props: [], errors: [] };
+  const out = { updated: new Date().toISOString(), props: [], errors: [], debug: DEBUG };
   for (const [sport, fn] of [['nhl', nhl], ['nfl', nfl]].filter(([sp]) => (process.env.SPORTS || 'nhl,nfl').includes(sp))) {
     try { out.props.push(...(await fn(out.errors))); } catch (e) { out.errors.push(`${sport}: ${e.message}`); }
   }
