@@ -60,6 +60,17 @@ async function oddsProps(cfg, sport) {
     catch (err) { return { e, err: err.message }; }
   });
   DEBUG[sport] = { eventsListed: events.length, inWindow: soon.length, games: res.map((r) => (r ? `${r.e.away_team} @ ${r.e.home_team}: ${r.err ? 'ERROR ' + r.err : (r.o.bookmakers || []).length + ' books'}` : 'failed')) };
+  // Everything the feed returned, before any filtering, so missing markets can be diagnosed
+  const seen = {};
+  for (const r of res) if (r && r.o) for (const b of r.o.bookmakers || []) for (const m of b.markets || []) {
+    const sm = (seen[m.key] = seen[m.key] || { books: [], outcomeNames: [], sample: null });
+    if (!sm.books.includes(b.key)) sm.books.push(b.key);
+    for (const x of m.outcomes || []) {
+      if (!sm.outcomeNames.includes(x.name)) sm.outcomeNames.push(x.name);
+      if (!sm.sample) sm.sample = { description: x.description, name: x.name, point: x.point, price: x.price };
+    }
+  }
+  DEBUG[sport].marketsSeen = seen;
   const map = new Map();
   // BOOKS=DraftKings,FanDuel,... keeps only those books. If unset, DFS and sweepstakes apps are dropped
   // because their synthetic even-money prices would distort best-odds and edge.
