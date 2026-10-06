@@ -5,4 +5,4 @@ export default async () => {
     headers: { 'x-refresh-key': process.env.REFRESH_KEY || '' },
   });
 };
-export const config = { schedule: '0 */2 * * *' };
+export const config = { schedule: '0 14 * * *' };
